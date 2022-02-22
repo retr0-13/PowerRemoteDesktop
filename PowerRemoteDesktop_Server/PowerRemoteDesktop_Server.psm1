@@ -61,6 +61,24 @@ Add-Type @"
 
         [DllImport("user32.dll")]
         public static extern int GetSystemMetrics(int nIndex);
+
+        [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Auto)]
+        public static extern IntPtr OpenDesktop(
+            [MarshalAs(UnmanagedType.LPTStr)] string DesktopName,
+            uint Flags,
+            bool Inherit,
+            uint Access
+        );
+
+        [DllImport("user32.dll", SetLastError = true)]
+        public static extern bool SetThreadDesktop(
+            IntPtr hDesktop
+        );
+
+        [DllImport("user32.dll", SetLastError = true)]
+        public static extern bool CloseDesktop(
+            IntPtr hDesktop
+        );
     }    
 
     public static class Kernel32
@@ -80,10 +98,10 @@ Add-Type @"
     {
         [DllImport("msvcrt.dll", CallingConvention=CallingConvention.Cdecl), SuppressUnmanagedCodeSecurity]
         public static extern IntPtr memcmp(IntPtr p1, IntPtr p2, IntPtr count);
-    }
+    }    
 "@
 
-$global:PowerRemoteDesktopVersion = "3.1.2"
+$global:PowerRemoteDesktopVersion = "4.0.0"
 
 $global:HostSyncHash = [HashTable]::Synchronized(@{
     host = $host
@@ -105,6 +123,7 @@ enum ProtocolCommand {
     BadRequest = 5
     ResourceFound = 6
     ResourceNotFound = 7
+    InsufficientPrivilege = 8
 }
 
 enum WorkerKind {
@@ -1622,6 +1641,10 @@ function New-RunSpace
             Default: None
             Description: Object to attach in runspace context.
 
+        .PARAMETER LogonUI
+            Type: Boolean
+            Default: False            
+
         .EXAMPLE
             New-RunSpace -Client $newClient -ScriptBlock { Start-Sleep -Seconds 10 }
     #>
@@ -1630,7 +1653,8 @@ function New-RunSpace
         [Parameter(Mandatory=$True)]
         [ScriptBlock] $ScriptBlock,
 
-        [PSCustomObject] $Param = $null
+        [PSCustomObject] $Param = $null,
+        [bool] $LogonUI = $false
     )   
 
     $runspace = [RunspaceFactory]::CreateRunspace()
@@ -1643,9 +1667,34 @@ function New-RunSpace
         $runspace.SessionStateProxy.SetVariable("Param", $Param) 
     }
 
-    $runspace.SessionStateProxy.SetVariable("HostSyncHash", $global:HostSyncHash)
+    $runspace.SessionStateProxy.SetVariable("HostSyncHash", $global:HostSyncHash)    
+    
+    $powershell = [PowerShell]::Create()
 
-    $powershell = [PowerShell]::Create().AddScript($ScriptBlock)
+    if ($LogonUI)
+    {
+        # Runspace prologue to update new thread desktop before something happens.  
+        # This code will switch new thread desktop from "WinSta0/default" to "WinSta0/winlogon".
+        # It requires to be "NT AUTHORITY/SYSTEM"
+        $null = $powershell.AddScript({    
+            $MAXIMUM_ALLOWED = 0x02000000;   
+
+            $winLogonDesktop = [User32]::OpenDesktop("winlogon", 0, $false, $MAXIMUM_ALLOWED);
+            if ($winLogonDesktop -eq [IntPtr]::Zero)
+            {                
+                return  
+            }
+            
+            if (-not [User32]::SetThreadDesktop($winLogonDesktop))
+            {
+                [User32]::CloseDesktop($winLogonDesktop)
+
+                return
+            }                    
+        })
+    }
+
+    $null = $powershell.AddScript($ScriptBlock)
 
     $powershell.Runspace = $runspace
 
@@ -2043,7 +2092,7 @@ class ViewerConfiguration {
     [int] $ImageCompressionQuality = 100    
     [PacketSize] $PacketSize = [PacketSize]::Size9216
     [BlockSize] $BlockSize = [BlockSize]::Size64
-    [bool] $FastResize = $false 
+    [bool] $FastResize = $false     
 
     [bool] ResizeDesktop()
     {
@@ -2071,6 +2120,7 @@ class ServerSession {
     [bool] $ViewOnly = $false
     [ClipboardMode] $Clipboard = [ClipboardMode]::Both
     [string] $ViewerLocation = ""
+    [bool] $LogonUI = $false
     
     [System.Collections.Generic.List[PSCustomObject]]
     $WorkerThreads = @()
@@ -2124,7 +2174,7 @@ class ServerSession {
             SafeHash = $this.SafeHash
         }
         
-        $this.WorkerThreads.Add((New-RunSpace -ScriptBlock $global:DesktopStreamScriptBlock -Param $param))       
+        $this.WorkerThreads.Add((New-RunSpace -ScriptBlock $global:DesktopStreamScriptBlock -Param $param -LogonUI $this.LogonUI))       
         
         ###
 
@@ -2148,7 +2198,7 @@ class ServerSession {
             SafeHash = $this.SafeHash
         }
 
-        $this.WorkerThreads.Add((New-RunSpace -ScriptBlock $global:EgressEventScriptBlock -Param $param))    
+        $this.WorkerThreads.Add((New-RunSpace -ScriptBlock $global:EgressEventScriptBlock -Param $param -LogonUI $this.LogonUI))    
         
         ###
 
@@ -2159,7 +2209,7 @@ class ServerSession {
             SafeHash = $this.SafeHash       
         }
                         
-        $this.WorkerThreads.Add((New-RunSpace -ScriptBlock $global:IngressEventScriptBlock -Param $param)) 
+        $this.WorkerThreads.Add((New-RunSpace -ScriptBlock $global:IngressEventScriptBlock -Param $param -LogonUI $this.LogonUI)) 
 
         ###
 
@@ -2477,11 +2527,23 @@ class SessionManager {
                 $session.SafeHash.ViewerConfiguration.FastResize = $viewerExpectation.FastResize
             }
 
+            if ($viewerExpectation.PSobject.Properties.name -contains "LogonUI")
+            {
+                $session.LogonUI = $viewerExpectation.LogonUI
+            }            
+            
+            if ($session.LogonUI -and -not [Security.Principal.WindowsIdentity]::GetCurrent().IsSystem)
+            {
+                $client.WriteLine((([ProtocolCommand]::InsufficientPrivilege)))
+
+                throw "Viewer has requested LogonUI access. LogonUI access requires to be SYSTEM User. Session creation aborted."                
+            }
+
+            $client.WriteLine((([ProtocolCommand]::Success)))
+
             Write-Verbose "New session successfully created."
 
-            $this.Sessions.Add($session)    
-            
-            $client.WriteLine((([ProtocolCommand]::Success)))
+            $this.Sessions.Add($session)
         }
         catch
         {
@@ -2677,35 +2739,6 @@ function Test-Administrator
     )    
 }
 
-class ValidateFileAttribute : System.Management.Automation.ValidateArgumentsAttribute
-{
-    <#
-        .SYNOPSIS
-            Check if file argument exists on disk.
-    #>
-
-    [void]Validate([System.Object] $arguments, [System.Management.Automation.EngineIntrinsics] $engineIntrinsics)
-    {
-        if(-not (Test-Path -Path $arguments))
-        {
-            throw [System.IO.FileNotFoundException]::new()
-        }      
-    }
-}
-
-class ValidateBase64StringAttribute : System.Management.Automation.ValidateArgumentsAttribute
-{
-    <#
-        .SYNOPSIS
-            Check if string argument is a valid Base64 String.
-    #>
-
-    [void]Validate([System.Object] $arguments, [System.Management.Automation.EngineIntrinsics] $engineIntrinsics)
-    {
-        [Convert]::FromBase64String($arguments)
-    }
-}
-
 function Invoke-RemoteDesktopServer
 {
     <#
@@ -2811,12 +2844,12 @@ function Invoke-RemoteDesktopServer
         [switch] $ViewOnly,
         [switch] $PreventComputerToSleep,
         [SecureString] $CertificatePassword = $null
-    )    
+    )        
 
     $oldErrorActionPreference = $ErrorActionPreference
     $oldVerbosePreference = $VerbosePreference    
     try
-    {
+    {            
         $ErrorActionPreference = "stop"
 
         if (-not $DisableVerbosity)
@@ -2828,16 +2861,16 @@ function Invoke-RemoteDesktopServer
             $VerbosePreference = "SilentlyContinue"
         }
 
-        Write-Banner    
-
+        Write-Banner                  
+    
         $null = [User32]::SetProcessDPIAware()
 
         if (-not (Test-Administrator) -and -not $CertificateFile -and -not $EncodedCertificate)
         {
-            throw "Insuficient Privilege`r`n`
-            When a custom X509 Certificate is not specified, server will generate and install a default one on local machine store.`r`n`
-            This operation requires Administrator Privilege.`r`n`
-            Specify your own X509 Certificate or run the server in a elevated prompt."
+            throw "Insuficient Privilege`r`n" +
+            "When a custom X509 Certificate is not specified, server will generate and install a default one on local machine store.`r`n" +
+            "This operation requires Administrator Privilege.`r`n" +
+            "Specify your own X509 Certificate or run the server in a elevated prompt."
         }
 
         $Certificate = $null
@@ -2968,6 +3001,6 @@ function Invoke-RemoteDesktopServer
     }
 }
 
-try {  
+try {      
     Export-ModuleMember -Function Invoke-RemoteDesktopServer
 } catch {}

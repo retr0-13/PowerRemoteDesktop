@@ -26,6 +26,7 @@ Write-Host "10. Image Quality High"
 Write-Host "11. Resize 10% + Bad Resize Quality (FastResize)"
 Write-Host "12. Resize 80%, Packet Size 16KiB, BlockSize 128x128"
 Write-Host "13. Bad Password"
+Write-Host "14. LogonUI"
 
 Write-Host ""
 
@@ -117,6 +118,13 @@ switch ($scenario)
         Write-Host "⚡Be sure that authentication fails with remote server." 
         
         Invoke-RemoteDesktopViewer -Password "bad@Bad123!Bad" -ServerAddress $remoteHost
+    }
+
+    14
+    {
+        Write-Host "⚡Check if you can capture LogonUI / Winlogon." 
+
+        Invoke-RemoteDesktopViewer -SecurePassword (ConvertTo-SecureString -String $password -AsPlainText -Force) -ServerAddress $remoteHost -LogonUI
     }
 
     default 

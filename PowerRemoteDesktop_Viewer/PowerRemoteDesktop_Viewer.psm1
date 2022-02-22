@@ -51,7 +51,7 @@ Add-Type @"
     }    
 "@
 
-$global:PowerRemoteDesktopVersion = "3.1.2"
+$global:PowerRemoteDesktopVersion = "4.0.0"
 
 $global:HostSyncHash = [HashTable]::Synchronized(@{
     host = $host
@@ -78,6 +78,7 @@ enum ProtocolCommand {
     BadRequest = 5
     ResourceFound = 6
     ResourceNotFound = 7
+    InsufficientPrivilege = 8
 }
 
 enum WorkerKind {
@@ -747,6 +748,7 @@ class ViewerSession
     [PacketSize] $PacketSize = [PacketSize]::Size9216
     [BlockSize] $BlockSize = [BlockSize]::Size64
     [bool] $FastResize = $false
+    [bool] $LogonUI = $false
 
     [ClientIO] $ClientDesktop = $null
     [ClientIO] $ClientEvents = $null
@@ -946,7 +948,8 @@ class ViewerSession
                 ImageCompressionQuality = $this.ImageCompressionQuality
                 PacketSize = $this.PacketSize
                 BlockSize = $this.BlockSize
-                FastResize = $this.FastResize           
+                FastResize = $this.FastResize      
+                LogonUI = $this.LogonUI     
             }
 
             if ($this.ViewerConfiguration.RequireResize)
@@ -964,9 +967,24 @@ class ViewerSession
 
             $client.WriteJson($viewerExpectation)
 
-            if ($client.ReadLine(5 * 1000) -cne [ProtocolCommand]::Success)
+            switch ($client.ReadLine(5 * 1000))
             {
-                throw "Remote server did not respond to our expectation in time."
+                ([ProtocolCommand]::Success)
+                { 
+                    break
+                }
+
+                ([ProtocolCommand]::InsufficientPrivilege)
+                {
+                    throw "Could not open LogonUI on remote Server. Remote Server lacks of required privilege."
+
+                    break
+                }
+
+                default
+                {
+                    throw "Remote server did not respond to our expectation correctly or in time."
+                }
             }
         } 
         catch
@@ -1655,6 +1673,11 @@ function Invoke-RemoteDesktopViewer
                 Control the quality of remote desktop resize (smoothing) if applicable.
                 If you lack of network speed, this option is recommended.
 
+        .PARAMETER LogonUI
+            Type: Switch
+            Default: None
+            Description: Tell remote server we want to capture LogonUI / Winlogon Desktop (If Applicable).
+
         .EXAMPLE
             Invoke-RemoteDesktopViewer -ServerAddress "192.168.0.10" -ServerPort "2801" -SecurePassword (ConvertTo-SecureString -String "s3cr3t!" -AsPlainText -Force)
             Invoke-RemoteDesktopViewer -ServerAddress "192.168.0.10" -ServerPort "2801" -Password "s3cr3t!"
@@ -1684,10 +1707,11 @@ function Invoke-RemoteDesktopViewer
         [switch] $AlwaysOnTop,
         [PacketSize] $PacketSize = [PacketSize]::Size9216,
         [BlockSize] $BlockSize = [BlockSize]::Size64,
-        [switch] $FastResize = $false
+        [switch] $FastResize = $false,
+        [switch] $LogonUI
     )
 
-    [System.Collections.Generic.List[PSCustomObject]]$runspaces = @()
+    [System.Collections.Generic.List[PSCustomObject]]$runspaces = @()    
 
     $oldErrorActionPreference = $ErrorActionPreference
     $oldVerbosePreference = $VerbosePreference
@@ -1734,6 +1758,7 @@ function Invoke-RemoteDesktopViewer
             $session.PacketSize = $PacketSize
             $session.BlockSize = $BlockSize
             $session.FastResize = $FastResize
+            $session.LogonUI = $LogonUI
 
             if ($Resize)
             {
