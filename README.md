@@ -503,6 +503,7 @@ You can then pass the output base64 certificate file to parameter `EncodedCertif
 
 * 🟢 Mutual Authentication for SSL/TLS (Client Certificate)                
 * 🟠 Interrupt sessions when local resolution has changed.
+* 🟠 Increase by x2 FPS rate using Low Level API's for Desktop Snapshot.
 * 🔴 LogonUI Support.
 
 🟢 = Easy
